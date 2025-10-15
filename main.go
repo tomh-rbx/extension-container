@@ -5,6 +5,7 @@ package main
 
 import (
 	"context"
+
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 	"github.com/steadybit/action-kit/go/action_kit_api/v2"
@@ -23,6 +24,7 @@ import (
 	"github.com/steadybit/extension-kit/extruntime"
 	"github.com/steadybit/extension-kit/extsignals"
 	_ "go.uber.org/automaxprocs" // Importing automaxprocs automatically adjusts GOMAXPROCS.
+
 	// You can find more details of its behavior from the doc comment of memlimit.SetGoMemLimitWithEnv.
 	_ "github.com/KimMachineGun/automemlimit" // By default, it sets `GOMEMLIMIT` to 90% of cgroup's memory limit.
 )
@@ -79,6 +81,7 @@ func main() {
 	action_kit_sdk.RegisterAction(extcontainer.NewNetworkBlackholeContainerAction(r, client))
 	action_kit_sdk.RegisterAction(extcontainer.NewNetworkBlockDnsContainerAction(r, client))
 	action_kit_sdk.RegisterAction(extcontainer.NewNetworkDelayContainerAction(r, client))
+	action_kit_sdk.RegisterAction(extcontainer.NewNetworkDNSErrorInjectionAction(r, client))
 	action_kit_sdk.RegisterAction(extcontainer.NewNetworkLimitBandwidthContainerAction(r, client))
 	action_kit_sdk.RegisterAction(extcontainer.NewNetworkCorruptPackagesContainerAction(r, client))
 	action_kit_sdk.RegisterAction(extcontainer.NewNetworkPackageLossContainerAction(r, client))
