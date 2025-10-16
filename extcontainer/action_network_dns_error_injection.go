@@ -35,8 +35,9 @@ func getNetworkDNSErrorInjectionDescription() action_kit_api.ActionDescription {
 		Version:     extbuild.GetSemverVersionStringOrUnknown(),
 		Icon:        extutil.Ptr(delayIcon),
 		TargetSelection: &action_kit_api.TargetSelection{
-			TargetType:         targetID,
-			SelectionTemplates: &targetSelectionTemplates,
+			TargetType:          targetID,
+			SelectionTemplates:  &targetSelectionTemplates,
+			QuantityRestriction: extutil.Ptr(action_kit_api.QuantityRestrictionExactlyOne),
 		},
 		Technology:  extutil.Ptr("Container"),
 		Category:    extutil.Ptr("Network"),
