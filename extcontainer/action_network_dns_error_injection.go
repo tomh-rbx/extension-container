@@ -4,8 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os/exec"
 	"strings"
 
+	"github.com/rs/zerolog/log"
 	"github.com/steadybit/action-kit/go/action_kit_api/v2"
 	"github.com/steadybit/action-kit/go/action_kit_commons/network"
 	"github.com/steadybit/action-kit/go/action_kit_commons/ociruntime"
@@ -19,7 +21,7 @@ func NewNetworkDNSErrorInjectionAction(r ociruntime.OciRuntime, client types.Cli
 	return &networkAction{
 		ociRuntime:   r,
 		client:       client,
-		optsProvider: dnsErrorInjection(r),
+		optsProvider: dnsErrorInjection(r, client),
 		optsDecoder:  dnsErrorInjectionDecode,
 		description:  getNetworkDNSErrorInjectionDescription(),
 	}
@@ -77,7 +79,7 @@ func getNetworkDNSErrorInjectionDescription() action_kit_api.ActionDescription {
 	}
 }
 
-func dnsErrorInjection(r ociruntime.OciRuntime) networkOptsProvider {
+func dnsErrorInjection(r ociruntime.OciRuntime, client types.Client) networkOptsProvider {
 	return func(ctx context.Context, sidecar network.SidecarOpts, request action_kit_api.PrepareActionRequestBody) (network.Opts, action_kit_api.Messages, error) {
 		errorTypes := extutil.ToStringArray(request.Config["dnsErrorTypes"])
 
@@ -104,33 +106,114 @@ func dnsErrorInjection(r ociruntime.OciRuntime) networkOptsProvider {
 			}
 		}
 
-		filter, messages, err := mapToNetworkFilter(ctx, r, sidecar, request.Config, getRestrictedEndpoints(request))
+		// For DNS error injection on containers, we MUST use the specific container IP
+		// Get the container's IP address using Docker inspect (more reliable than netns introspection)
+		var containerIP string
+
+		// Extract container ID from the request target
+		containerID := ""
+		if targetName, ok := request.Target.Attributes["container.id"]; ok && len(targetName) > 0 {
+			// Remove "docker://" prefix if present
+			containerID = strings.TrimPrefix(targetName[0], "docker://")
+		}
+
+		if containerID != "" && client != nil {
+			// Use container runtime API to get the container's IP
+			containerIP, err := getContainerIPFromRuntime(ctx, client, containerID)
+			if err != nil {
+				log.Warn().
+					Str("container_id", sidecar.IdSuffix).
+					Str("runtime", string(client.Runtime())).
+					Err(err).
+					Msg("failed to get container IP from runtime API, falling back to netns introspection")
+			} else {
+				log.Info().
+					Str("container_id", sidecar.IdSuffix).
+					Str("runtime", string(client.Runtime())).
+					Str("detected_ip_from_runtime", containerIP).
+					Msg("detected container IP from runtime API for DNS error injection targeting")
+			}
+		}
+
+		// Fallback: Get IP by introspecting the container's network namespace
+		if containerIP == "" {
+			containerRunner := network.NewRuncRunner(r, sidecar)
+			containerInterfaces, err := network.ListInterfaces(ctx, containerRunner)
+			if err != nil {
+				return nil, nil, fmt.Errorf("failed to get container interfaces: %w", err)
+			}
+
+			// Find the container's IP from eth0
+			for _, iface := range containerInterfaces {
+				if iface.Name == "eth0" && len(iface.AddrInfo) > 0 {
+					for _, addr := range iface.AddrInfo {
+						if addr.Family == "inet" {
+							containerIP = addr.Local
+							break
+						}
+					}
+				}
+			}
+
+			if containerIP != "" {
+				log.Info().
+					Str("container_id", sidecar.IdSuffix).
+					Str("detected_ip_from_netns", containerIP).
+					Msg("detected container IP from netns for DNS error injection targeting")
+			}
+		}
+
+		if containerIP == "" {
+			return nil, nil, fmt.Errorf("could not determine container IP address for DNS error injection")
+		}
+
+		// Override the config to use the container's specific IP
+		// This ensures we only affect this container, not all containers on docker0
+		configWithIP := make(map[string]interface{})
+		for k, v := range request.Config {
+			configWithIP[k] = v
+		}
+		// Must use []interface{} for compatibility with extutil.ToStringArray
+		configWithIP["ip"] = []interface{}{containerIP}
+
+		log.Debug().
+			Str("container_id", sidecar.IdSuffix).
+			Interface("config_ip", configWithIP["ip"]).
+			Msg("overriding config with container IP")
+
+		filter, messages, err := mapToNetworkFilter(ctx, r, sidecar, configWithIP, getRestrictedEndpoints(request))
 		if err != nil {
 			return nil, nil, err
 		}
 
 		interfaces := extutil.ToStringArray(request.Config["networkInterface"])
 		if len(interfaces) == 0 {
-			// For DNS error injection, we need to target the container's veth interface on the host
-			// This allows us to run eBPF on the host and filter by container IP
-			vethInterface, err := findContainerVethInterface(ctx, sidecar)
+			// Attach to docker bridge to reliably see DNS responses to the container IP
+			hostRunner := network.NewProcessRunner()
+			hostIfs, err := network.ListInterfaces(ctx, hostRunner)
 			if err != nil {
-				return nil, []action_kit_api.Message{{
-					Level:   extutil.Ptr(action_kit_api.Warn),
-					Message: fmt.Sprintf("Could not detect container veth interface: %v. Using default interfaces.", err),
-				}}, nil
+				return nil, nil, fmt.Errorf("failed to list host interfaces: %w", err)
 			}
-			if vethInterface != "" {
-				interfaces = append(interfaces, vethInterface)
-			} else {
-				// Fallback to container's internal interfaces if veth detection fails
-				ifs, errList := network.ListInterfaces(ctx, network.NewRuncRunner(r, sidecar))
-				if errList != nil {
-					return nil, nil, errList
-				}
-				for _, i := range ifs {
+
+			// Prefer docker0, else br-*
+			for _, i := range hostIfs {
+				if i.Name == "docker0" {
 					interfaces = append(interfaces, i.Name)
+					break
 				}
+			}
+			if len(interfaces) == 0 {
+				for _, i := range hostIfs {
+					if strings.HasPrefix(i.Name, "br-") {
+						interfaces = append(interfaces, i.Name)
+						break
+					}
+				}
+			}
+
+			// As last resort, still add docker0 name even if not listed (will error at attach if missing)
+			if len(interfaces) == 0 {
+				interfaces = append(interfaces, "docker0")
 			}
 		}
 
@@ -143,6 +226,7 @@ func dnsErrorInjection(r ociruntime.OciRuntime) networkOptsProvider {
 			Interfaces:  interfaces,
 			ErrorTypes:  errorTypes,
 			ExecutionID: request.ExecutionId.String(),
+			IsContainer: true, // This is a container-level attack
 		}
 
 		// Validate that we have specific targets for safety
@@ -163,8 +247,156 @@ func dnsErrorInjectionDecode(data json.RawMessage) (network.Opts, error) {
 	return &opts, err
 }
 
-// findContainerVethInterface detects the container's network interface on the host
-func findContainerVethInterface(ctx context.Context, sidecar network.SidecarOpts) (string, error) {
+// getContainerIPFromRuntime uses the container runtime API to get the container's primary IPv4 address
+// This is more reliable than introspecting the network namespace
+// Supports Docker, containerd, and CRI-O
+func getContainerIPFromRuntime(ctx context.Context, client types.Client, containerID string) (string, error) {
+	runtime := client.Runtime()
+
+	switch runtime {
+	case types.RuntimeDocker:
+		return getContainerIPFromDocker(ctx, containerID)
+	case types.RuntimeContainerd:
+		return getContainerIPFromContainerd(ctx, containerID)
+	case types.RuntimeCrio:
+		return getContainerIPFromCrio(ctx, containerID)
+	default:
+		return "", fmt.Errorf("unsupported container runtime: %s", runtime)
+	}
+}
+
+// getContainerIPFromDocker extracts the IP from Docker
+func getContainerIPFromDocker(ctx context.Context, containerID string) (string, error) {
+	cmd := exec.CommandContext(ctx, "docker", "inspect",
+		"--format", "{{range.NetworkSettings.Networks}}{{.IPAddress}}{{end}}",
+		containerID)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("docker inspect failed: %w, output: %s", err, string(output))
+	}
+
+	ip := strings.TrimSpace(string(output))
+	if ip == "" || ip == "<no value>" {
+		return "", fmt.Errorf("no IP address found in docker inspect output")
+	}
+
+	return ip, nil
+}
+
+// getContainerIPFromContainerd extracts the IP from containerd via crictl or ctr
+func getContainerIPFromContainerd(ctx context.Context, containerID string) (string, error) {
+	// Try crictl first (most common for K8s environments)
+	if _, err := exec.LookPath("crictl"); err == nil {
+		return getContainerIPViaCrictl(ctx, containerID)
+	}
+
+	// Fallback to ctr (containerd CLI)
+	if _, err := exec.LookPath("ctr"); err == nil {
+		return getContainerIPViaCtr(ctx, containerID)
+	}
+
+	return "", fmt.Errorf("neither crictl nor ctr found for containerd runtime")
+}
+
+// getContainerIPFromCrio extracts the IP from CRI-O via crictl
+func getContainerIPFromCrio(ctx context.Context, containerID string) (string, error) {
+	return getContainerIPViaCrictl(ctx, containerID)
+}
+
+// getContainerIPViaCrictl uses crictl inspect to get the container IP
+func getContainerIPViaCrictl(ctx context.Context, containerID string) (string, error) {
+	// crictl inspect returns JSON with IP in different possible locations
+	cmd := exec.CommandContext(ctx, "crictl", "inspect", containerID)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("crictl inspect failed: %w, output: %s", err, string(output))
+	}
+
+	// Parse JSON to extract IP
+	// Try multiple possible JSON paths: .info.network.ip, .status.network.ip
+	var result map[string]interface{}
+	if err := json.Unmarshal(output, &result); err != nil {
+		return "", fmt.Errorf("failed to parse crictl output: %w", err)
+	}
+
+	// Try .info.network.ip
+	if info, ok := result["info"].(map[string]interface{}); ok {
+		if network, ok := info["network"].(map[string]interface{}); ok {
+			if ip, ok := network["ip"].(string); ok && ip != "" {
+				return ip, nil
+			}
+		}
+	}
+
+	// Try .status.network.ip
+	if status, ok := result["status"].(map[string]interface{}); ok {
+		if network, ok := status["network"].(map[string]interface{}); ok {
+			if ip, ok := network["ip"].(string); ok && ip != "" {
+				return ip, nil
+			}
+		}
+	}
+
+	return "", fmt.Errorf("no IP address found in crictl inspect output")
+}
+
+// getContainerIPViaCtr uses ctr (containerd CLI) to get the container IP
+// This requires getting the PID and using nsenter
+func getContainerIPViaCtr(ctx context.Context, containerID string) (string, error) {
+	// Get the task PID
+	cmd := exec.CommandContext(ctx, "ctr", "tasks", "ls")
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("ctr tasks ls failed: %w", err)
+	}
+
+	// Parse output to find PID for our container
+	lines := strings.Split(string(output), "\n")
+	var pid string
+	for _, line := range lines {
+		if strings.Contains(line, containerID) {
+			fields := strings.Fields(line)
+			if len(fields) >= 2 {
+				pid = fields[1]
+				break
+			}
+		}
+	}
+
+	if pid == "" {
+		return "", fmt.Errorf("could not find PID for container %s", containerID)
+	}
+
+	// Use nsenter to get the IP from within the container's network namespace
+	cmd = exec.CommandContext(ctx, "nsenter", "-t", pid, "-n",
+		"ip", "-4", "addr", "show", "eth0")
+	output, err = cmd.CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("nsenter ip addr failed: %w, output: %s", err, string(output))
+	}
+
+	// Parse output to extract IP address
+	// Example line: "    inet 172.17.0.2/16 brd 172.17.255.255 scope global eth0"
+	lines = strings.Split(string(output), "\n")
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "inet ") {
+			fields := strings.Fields(line)
+			if len(fields) >= 2 {
+				// Extract IP before the /mask
+				ipWithMask := fields[1]
+				ip := strings.Split(ipWithMask, "/")[0]
+				return ip, nil
+			}
+		}
+	}
+
+	return "", fmt.Errorf("could not parse IP from nsenter output")
+}
+
+// findContainerVethInterface detects the best network interface on the host for eBPF attachment
+// to target this specific container's DNS traffic
+func findContainerVethInterface(ctx context.Context, r ociruntime.OciRuntime, sidecar network.SidecarOpts) (string, error) {
 	// Get the container's network namespace inode
 	var netnsInode uint64
 	for _, ns := range sidecar.TargetProcess.Namespaces {
@@ -178,40 +410,33 @@ func findContainerVethInterface(ctx context.Context, sidecar network.SidecarOpts
 		return "", fmt.Errorf("no network namespace found")
 	}
 
-	// Use the host runner to list interfaces on the host
+	// Get all interfaces on the host
 	hostRunner := network.NewProcessRunner()
-	interfaces, err := network.ListInterfaces(ctx, hostRunner)
+	hostInterfaces, err := network.ListInterfaces(ctx, hostRunner)
 	if err != nil {
 		return "", fmt.Errorf("failed to list host interfaces: %w", err)
 	}
 
-	// PRIORITY 1: Look for Docker bridge (docker0, br-*, etc.)
-	// This is where container traffic actually flows in Docker's networking setup
-	// TC hooks on the bridge are more reliable than on physical interfaces for container traffic
-	for _, iface := range interfaces {
-		if iface.Name == "docker0" || strings.HasPrefix(iface.Name, "br-") {
+	// IMPORTANT: We attach to docker0 (the bridge) rather than the specific veth interface
+	// because:
+	// 1. docker0 sees ALL container traffic, making packet capture reliable
+	// 2. The eBPF program filters by the container's specific IP address, ensuring
+	//    only the target container's DNS traffic is affected
+	// 3. This approach is more robust than trying to identify the exact veth interface,
+	//    especially in complex multi-container environments
+	//
+	// Even though multiple containers use docker0, the IP-based filtering in the eBPF
+	// program ensures we only inject errors into DNS traffic for the targeted container.
+
+	for _, iface := range hostInterfaces {
+		if iface.Name == "docker0" {
+			return "docker0", nil
+		}
+		// Also check for custom bridge networks (br-*)
+		if strings.HasPrefix(iface.Name, "br-") {
 			return iface.Name, nil
 		}
 	}
 
-	// PRIORITY 2: Look for the specific veth interface for this container
-	// This is the most targeted approach
-	for _, iface := range interfaces {
-		if strings.HasPrefix(iface.Name, "veth") {
-			// TODO: Match the veth to the specific container's network namespace
-			// For now, return the first veth (works if there's only one container)
-			return iface.Name, nil
-		}
-	}
-
-	// PRIORITY 3: Fallback to physical interfaces (eno1, eth0, etc.)
-	// Note: TC hooks on physical interfaces often don't see container traffic
-	// due to Docker's network architecture
-	for _, iface := range interfaces {
-		if strings.HasPrefix(iface.Name, "eno") || strings.HasPrefix(iface.Name, "eth") {
-			return iface.Name, nil
-		}
-	}
-
-	return "", fmt.Errorf("no suitable network interface found on host")
+	return "", fmt.Errorf("no Docker bridge interface (docker0 or br-*) found on host")
 }
