@@ -81,7 +81,7 @@ func getNetworkDNSErrorInjectionDescription() action_kit_api.ActionDescription {
 		Kind:        action_kit_api.Attack,
 		TimeControl: action_kit_api.TimeControlExternal,
 		Status: extutil.Ptr(action_kit_api.MutatingEndpointReferenceWithCallInterval{
-			CallInterval: extutil.Ptr("1s"),
+			CallInterval: extutil.Ptr("2s"),
 		}),
 		Widgets: extutil.Ptr([]action_kit_api.Widget{
 			action_kit_api.MarkdownWidget{
